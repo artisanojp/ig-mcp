@@ -6,12 +6,12 @@
         "/path/to/ig-mcp/src/instagram_mcp_server.py"
       ],
       "env": {
-        "INSTAGRAM_ACCESS_TOKEN": "your_long_lived_access_token",
+        "INSTAGRAM_ACCESS_TOKEN": "your_long_lived_access_token_here",
         "FACEBOOK_APP_ID": "your_facebook_app_id",
         "FACEBOOK_APP_SECRET": "your_facebook_app_secret",
-        "INSTAGRAM_BUSINESS_ACCOUNT_ID": "your_instagram_business_account_id",
-        "LOG_LEVEL": "INFO"
+        "LOG_LEVEL": "INFO",
+        "INSTAGRAM_BUSINESS_ACCOUNT_ID": "your_instagram_business_account_id"
       }
     }
   }
-} 
+}
