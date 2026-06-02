@@ -46,6 +46,7 @@ WORKDIR /app
 COPY src/ ./src/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
+COPY assets/ ./assets/
 
 # Create necessary directories
 RUN mkdir -p logs cache && \
@@ -54,11 +55,11 @@ RUN mkdir -p logs cache && \
 # Switch to non-root user
 USER appuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import src.config; print('Health check passed')" || exit 1
+# Health check — probes the HTTP /health endpoint served by the MCP app
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1
 
-# Expose port (if running as HTTP server)
+# Expose the MCP Streamable HTTP port
 EXPOSE 8000
 
 # Default command

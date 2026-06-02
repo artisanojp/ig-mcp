@@ -5,7 +5,7 @@ Configuration management for Instagram MCP Server.
 from pathlib import Path
 from typing import List, Optional
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -25,7 +25,9 @@ class InstagramMCPSettings(BaseSettings):
     )
 
     # API Configuration
-    instagram_api_version: str = Field("v19.0", description="Instagram API version")
+    # v22.0+ is required for the audience demographics metrics
+    # (follower_demographics, reached/engaged_audience_demographics).
+    instagram_api_version: str = Field("v22.0", description="Instagram API version")
     instagram_api_base_url: str = Field(
         "https://graph.facebook.com", description="Instagram API base URL"
     )
@@ -73,7 +75,56 @@ class InstagramMCPSettings(BaseSettings):
     # MCP Server Configuration
     mcp_server_name: str = Field("instagram-mcp-server", description="MCP server name")
     mcp_server_version: str = Field("1.0.0", description="MCP server version")
-    mcp_transport: str = Field("stdio", description="MCP transport")
+    mcp_transport: str = Field("streamable-http", description="MCP transport")
+
+    # MCP Transport / Networking
+    mcp_host: str = Field("0.0.0.0", description="Host to bind the MCP HTTP server")
+    mcp_port: int = Field(8000, description="Port to bind the MCP HTTP server")
+
+    # Microsoft Entra ID (Microsoft 365) authentication
+    # Gates WHO may call the server. The shared Instagram token (above) remains the
+    # credential the server uses to talk to Instagram and is never exposed to users.
+    auth_enabled: bool = Field(
+        True, description="Require Entra ID auth on the HTTP transport"
+    )
+    entra_tenant_id: Optional[str] = Field(
+        None, description="Entra ID tenant (directory) ID"
+    )
+    entra_client_id: Optional[str] = Field(
+        None,
+        description="Entra ID app registration (client) ID for this resource server",
+    )
+    entra_audience: Optional[str] = Field(
+        None, description="Expected JWT audience (defaults to api://<client_id>)"
+    )
+    entra_required_role: str = Field(
+        "IGMCP.Use", description="App role required to access the server"
+    )
+    server_public_url: Optional[str] = Field(
+        None,
+        description="Public HTTPS base URL of this server (OAuth resource identifier)",
+    )
+
+    # OAuth broker: this server acts as the OAuth 2.1 Authorization Server and brokers
+    # login to Entra ID. The client secret is used only server-side for the back-channel
+    # code exchange with Entra — it is never exposed to users or MCP clients.
+    entra_client_secret: Optional[str] = Field(
+        None, description="Entra app client secret for the OAuth broker back-channel"
+    )
+    entra_redirect_path: str = Field(
+        "/oauth/entra/callback",
+        description="Path Entra redirects to after M365 login",
+    )
+    entra_login_scope: str = Field(
+        "mcp.access", description="Delegated scope the broker requests from Entra"
+    )
+    oauth_code_ttl: int = Field(
+        600, description="Issued authorization code lifetime (s)"
+    )
+    oauth_token_ttl: int = Field(3600, description="Issued access token lifetime (s)")
+    oauth_refresh_ttl: int = Field(
+        2592000, description="Issued refresh token lifetime (s)"
+    )
 
     # Optional: Database Configuration
     database_url: Optional[str] = Field(
@@ -121,6 +172,78 @@ class InstagramMCPSettings(BaseSettings):
         if not v.startswith("v"):
             raise ValueError("API version must start with 'v' (e.g., 'v19.0')")
         return v
+
+    @model_validator(mode="after")
+    def validate_auth_config(self):
+        """Ensure Entra ID settings are present when auth is enabled."""
+        if self.auth_enabled:
+            missing = [
+                name
+                for name, value in (
+                    ("ENTRA_TENANT_ID", self.entra_tenant_id),
+                    ("ENTRA_CLIENT_ID", self.entra_client_id),
+                    ("ENTRA_CLIENT_SECRET", self.entra_client_secret),
+                    ("SERVER_PUBLIC_URL", self.server_public_url),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "AUTH_ENABLED is true but required Entra settings are missing: "
+                    f"{', '.join(missing)}. Set them, or set AUTH_ENABLED=false for "
+                    "local development."
+                )
+        return self
+
+    @property
+    def entra_issuer(self) -> Optional[str]:
+        """Entra ID v2.0 issuer URL for the configured tenant."""
+        if self.entra_tenant_id:
+            return f"https://login.microsoftonline.com/{self.entra_tenant_id}/v2.0"
+        return None
+
+    @property
+    def entra_audience_value(self) -> Optional[str]:
+        """Expected JWT audience, defaulting to the App ID URI form."""
+        if self.entra_audience:
+            return self.entra_audience
+        if self.entra_client_id:
+            return f"api://{self.entra_client_id}"
+        return None
+
+    @property
+    def entra_authorize_endpoint(self) -> Optional[str]:
+        """Entra ID v2.0 authorization endpoint."""
+        if self.entra_tenant_id:
+            return (
+                f"https://login.microsoftonline.com/{self.entra_tenant_id}"
+                "/oauth2/v2.0/authorize"
+            )
+        return None
+
+    @property
+    def entra_token_endpoint(self) -> Optional[str]:
+        """Entra ID v2.0 token endpoint (back-channel code exchange)."""
+        if self.entra_tenant_id:
+            return (
+                f"https://login.microsoftonline.com/{self.entra_tenant_id}"
+                "/oauth2/v2.0/token"
+            )
+        return None
+
+    @property
+    def entra_redirect_uri(self) -> Optional[str]:
+        """Absolute redirect URI Entra returns to (must be registered on the app)."""
+        if self.server_public_url:
+            return f"{self.server_public_url.rstrip('/')}{self.entra_redirect_path}"
+        return None
+
+    @property
+    def entra_login_scope_full(self) -> Optional[str]:
+        """The full delegated scope string requested from Entra."""
+        if self.entra_client_id:
+            return f"api://{self.entra_client_id}/{self.entra_login_scope}"
+        return None
 
     @property
     def instagram_api_url(self) -> str:

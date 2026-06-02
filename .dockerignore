@@ -1,0 +1,42 @@
+# Keep secrets and local junk out of the build context and image
+.env
+.env.*
+*.env
+env.example
+
+# VCS / CI
+.git
+.gitignore
+.github
+
+# Python caches and virtualenvs
+__pycache__/
+*.py[cod]
+.venv
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Tests and docs (not needed at runtime)
+tests/
+docs/
+*.md
+
+# Local runtime artifacts
+logs/
+cache/
+*.log
+
+# Security / coverage reports
+.coverage
+htmlcov/
+bandit-report.json
+safety-report.json
+*-report.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

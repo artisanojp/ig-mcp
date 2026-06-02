@@ -17,6 +17,7 @@ from .config import get_settings
 from .models.instagram_models import (
     AccountInsight,
     FacebookPage,
+    FacebookPost,
     InsightMetric,
     InsightPeriod,
     InstagramConversation,
@@ -76,6 +77,9 @@ class InstagramClient:
 
         # Cache for storing responses
         self._cache: Dict[str, Dict[str, Any]] = {}
+
+        # Cache of Facebook Page access tokens, keyed by page id.
+        self._page_tokens: Dict[str, str] = {}
 
         logger.info(
             "Instagram client initialized",
@@ -146,9 +150,9 @@ class InstagramClient:
 
             # Instagram accepted ratios with tolerance
             ACCEPTED_RATIOS = {
-                "4:5 (portrait)": (0.8, 0.78, 0.82),      # 4:5 with ±2% tolerance
-                "1:1 (square)": (1.0, 0.98, 1.02),        # 1:1 with ±2% tolerance
-                "1.91:1 (landscape)": (1.91, 1.89, 1.93), # 1.91:1 with ±2% tolerance
+                "4:5 (portrait)": (0.8, 0.78, 0.82),  # 4:5 with ±2% tolerance
+                "1:1 (square)": (1.0, 0.98, 1.02),  # 1:1 with ±2% tolerance
+                "1.91:1 (landscape)": (1.91, 1.89, 1.93),  # 1.91:1 with ±2% tolerance
             }
 
             # Check if ratio matches any accepted ratio
@@ -159,7 +163,7 @@ class InstagramClient:
                         width=width,
                         height=height,
                         ratio=ratio,
-                        accepted_as=ratio_name
+                        accepted_as=ratio_name,
                     )
                     return
 
@@ -178,18 +182,24 @@ class InstagramClient:
                 width=width,
                 height=height,
                 ratio=ratio,
-                url=image_url
+                url=image_url,
             )
 
             raise InstagramAPIError(error_msg)
 
         except httpx.HTTPError as e:
-            logger.error("Failed to download image for validation", error=str(e), url=image_url)
-            raise InstagramAPIError(f"Failed to download image for validation: {str(e)}")
+            logger.error(
+                "Failed to download image for validation", error=str(e), url=image_url
+            )
+            raise InstagramAPIError(
+                f"Failed to download image for validation: {str(e)}"
+            )
         except Exception as e:
             if isinstance(e, InstagramAPIError):
                 raise
-            logger.error("Failed to validate image aspect ratio", error=str(e), url=image_url)
+            logger.error(
+                "Failed to validate image aspect ratio", error=str(e), url=image_url
+            )
             raise InstagramAPIError(f"Failed to validate image: {str(e)}")
 
     async def _make_request(
@@ -214,8 +224,8 @@ class InstagramClient:
         if params is None:
             params = {}
 
-        # Add access token to params
-        params["access_token"] = self.access_token
+        # Add access token to params (callers may override, e.g. a Page token).
+        params.setdefault("access_token", self.access_token)
 
         # Check cache first for GET requests
         cache_key = self._get_cache_key(endpoint, params)
@@ -473,8 +483,15 @@ class InstagramClient:
         account_id: Optional[str] = None,
         metrics: Optional[List[str]] = None,
         period: InsightPeriod = InsightPeriod.DAY,
+        breakdown: Optional[str] = None,
+        timeframe: Optional[str] = None,
     ) -> List[AccountInsight]:
-        """Get account-level insights."""
+        """Get account-level insights.
+
+        ``breakdown`` and ``timeframe`` are required by the demographic metrics
+        (follower_demographics, reached_audience_demographics,
+        engaged_audience_demographics) and ignored by others.
+        """
         if not account_id:
             account_id = self.settings.instagram_business_account_id
 
@@ -487,8 +504,13 @@ class InstagramClient:
         params = {
             "metric": ",".join(metrics),
             "period": period.value,
-            "metric_type": "total_value"  # Required for action metrics like website_clicks
+            "metric_type": "total_value",  # Required for action + demographic metrics
         }
+        # Demographic metrics require a breakdown dimension and a timeframe.
+        if breakdown:
+            params["breakdown"] = breakdown
+        if timeframe:
+            params["timeframe"] = timeframe
 
         try:
             data = await self._make_request(
@@ -505,6 +527,111 @@ class InstagramClient:
             logger.error("Failed to get account insights", error=str(e))
             raise InstagramAPIError(f"Failed to get account insights: {str(e)}")
 
+    async def _get_page_access_token(self, page_id: str) -> str:
+        """Fetch (and cache) a Facebook Page access token for Page-scoped calls."""
+        if page_id in self._page_tokens:
+            return self._page_tokens[page_id]
+        data = await self._make_request(
+            "GET", page_id, params={"fields": "access_token"}
+        )
+        token = data.get("access_token")
+        if not token:
+            raise InstagramAPIError(
+                f"No Page access token available for page {page_id}. The token needs "
+                "pages_read_engagement / pages_show_list and access to this Page."
+            )
+        self._page_tokens[page_id] = token
+        return token
+
+    async def _resolve_page_id(self, page_id: Optional[str]) -> str:
+        """Default to the first connected Facebook Page when no id is given."""
+        if page_id:
+            return page_id
+        pages = await self.get_account_pages()
+        if not pages:
+            raise InstagramAPIError("No Facebook pages found for this account.")
+        return pages[0].id
+
+    async def get_facebook_posts(
+        self, page_id: Optional[str] = None, limit: int = 25
+    ) -> List[FacebookPost]:
+        """Get recent Facebook Page posts with engagement counts.
+
+        Uses post fields (not the deprecated post-insights metrics) for reliable
+        reaction/comment/share counts.
+        """
+        page_id = await self._resolve_page_id(page_id)
+        page_token = await self._get_page_access_token(page_id)
+
+        fields = (
+            "id,created_time,message,permalink_url,status_type,shares,"
+            "comments.summary(true).limit(0),reactions.summary(true).limit(0)"
+        )
+        params = {
+            "fields": fields,
+            "limit": min(limit, 100),
+            "access_token": page_token,
+        }
+
+        try:
+            data = await self._make_request("GET", f"{page_id}/posts", params=params)
+            posts = []
+            for item in data.get("data", []):
+                posts.append(
+                    FacebookPost(
+                        id=item["id"],
+                        created_time=item.get("created_time"),
+                        message=item.get("message"),
+                        permalink_url=item.get("permalink_url"),
+                        status_type=item.get("status_type"),
+                        reactions_count=item.get("reactions", {})
+                        .get("summary", {})
+                        .get("total_count"),
+                        comments_count=item.get("comments", {})
+                        .get("summary", {})
+                        .get("total_count"),
+                        shares_count=item.get("shares", {}).get("count", 0),
+                    )
+                )
+            return posts
+
+        except Exception as e:
+            logger.error("Failed to get Facebook posts", error=str(e))
+            raise InstagramAPIError(f"Failed to get Facebook posts: {str(e)}")
+
+    async def get_facebook_page_insights(
+        self,
+        page_id: Optional[str] = None,
+        metrics: Optional[List[str]] = None,
+        period: InsightPeriod = InsightPeriod.DAY,
+    ) -> List[AccountInsight]:
+        """Get Facebook Page-level insights (best-effort; Meta has deprecated many)."""
+        page_id = await self._resolve_page_id(page_id)
+        page_token = await self._get_page_access_token(page_id)
+
+        if not metrics:
+            metrics = [
+                "page_impressions_unique",
+                "page_post_engagements",
+                "page_views_total",
+                "page_follows",
+            ]
+
+        params = {
+            "metric": ",".join(metrics),
+            "period": period.value,
+            "metric_type": "total_value",
+            "access_token": page_token,
+        }
+
+        try:
+            data = await self._make_request("GET", f"{page_id}/insights", params=params)
+            return [AccountInsight(**item) for item in data.get("data", [])]
+
+        except Exception as e:
+            logger.error("Failed to get Facebook page insights", error=str(e))
+            raise InstagramAPIError(f"Failed to get Facebook page insights: {str(e)}")
+
     async def validate_access_token(self) -> bool:
         """Validate the access token."""
         try:
@@ -516,9 +643,7 @@ class InstagramClient:
             return False
 
     async def get_conversations(
-        self,
-        page_id: Optional[str] = None,
-        limit: int = 25
+        self, page_id: Optional[str] = None, limit: int = 25
     ) -> List[InstagramConversation]:
         """
         Get Instagram DM conversations for a Facebook page.
@@ -529,23 +654,21 @@ class InstagramClient:
             # Try to get page ID from connected pages
             pages = await self.get_account_pages()
             if not pages:
-                raise InstagramAPIError("No Facebook pages found. Please connect a Facebook page to your Instagram account.")
+                raise InstagramAPIError(
+                    "No Facebook pages found. Please connect a Facebook page to your Instagram account."
+                )
             page_id = pages[0].id
             logger.info(f"Using page ID: {page_id}")
 
         fields = "id,updated_time,message_count"
-        params = {
-            "platform": "instagram",
-            "fields": fields,
-            "limit": min(limit, 100)
-        }
+        params = {"platform": "instagram", "fields": fields, "limit": min(limit, 100)}
 
         try:
             data = await self._make_request(
                 "GET",
                 f"{page_id}/conversations",
                 params=params,
-                use_facebook_api=True  # DMs use graph.facebook.com
+                use_facebook_api=True,  # DMs use graph.facebook.com
             )
             conversations = []
 
@@ -559,7 +682,11 @@ class InstagramClient:
             logger.error("Failed to get conversations", error=str(e))
             error_msg = str(e)
             # Detect Advanced Access permission error
-            if "#2" in error_msg or "unavailable" in error_msg.lower() or "temporarily" in error_msg.lower():
+            if (
+                "#2" in error_msg
+                or "unavailable" in error_msg.lower()
+                or "temporarily" in error_msg.lower()
+            ):
                 error_msg += (
                     "\n\n⚠️  This error indicates that instagram_manage_messages permission "
                     "requires Advanced Access from Meta via App Review. "
@@ -571,9 +698,7 @@ class InstagramClient:
             raise InstagramAPIError(f"Failed to get conversations: {str(e)}")
 
     async def get_conversation_messages(
-        self,
-        conversation_id: str,
-        limit: int = 25
+        self, conversation_id: str, limit: int = 25
     ) -> List[InstagramMessage]:
         """
         Get messages from a specific Instagram DM conversation.
@@ -581,31 +706,38 @@ class InstagramClient:
         Note: Requires instagram_manage_messages permission.
         """
         fields = "id,from,to,message,created_time,attachments"
-        params = {
-            "fields": f"messages{{" + fields + "}}",
-            "limit": min(limit, 100)
-        }
+        params = {"fields": f"messages{{" + fields + "}}", "limit": min(limit, 100)}
 
         try:
             data = await self._make_request(
                 "GET",
                 conversation_id,
                 params=params,
-                use_facebook_api=True  # DMs use graph.facebook.com
+                use_facebook_api=True,  # DMs use graph.facebook.com
             )
             messages = []
 
             for item in data.get("messages", {}).get("data", []):
                 messages.append(InstagramMessage(**item))
 
-            logger.info(f"Retrieved {len(messages)} messages from conversation {conversation_id}")
+            logger.info(
+                f"Retrieved {len(messages)} messages from conversation {conversation_id}"
+            )
             return messages
 
         except InstagramAPIError as e:
-            logger.error("Failed to get conversation messages", error=str(e), conversation_id=conversation_id)
+            logger.error(
+                "Failed to get conversation messages",
+                error=str(e),
+                conversation_id=conversation_id,
+            )
             error_msg = str(e)
             # Detect Advanced Access permission error
-            if "#2" in error_msg or "unavailable" in error_msg.lower() or "temporarily" in error_msg.lower():
+            if (
+                "#2" in error_msg
+                or "unavailable" in error_msg.lower()
+                or "temporarily" in error_msg.lower()
+            ):
                 error_msg += (
                     "\n\n⚠️  This error indicates that instagram_manage_messages permission "
                     "requires Advanced Access from Meta via App Review. "
@@ -613,13 +745,14 @@ class InstagramClient:
                 )
             raise InstagramAPIError(error_msg)
         except Exception as e:
-            logger.error("Failed to get conversation messages", error=str(e), conversation_id=conversation_id)
+            logger.error(
+                "Failed to get conversation messages",
+                error=str(e),
+                conversation_id=conversation_id,
+            )
             raise InstagramAPIError(f"Failed to get conversation messages: {str(e)}")
 
-    async def send_dm(
-        self,
-        request: SendDMRequest
-    ) -> SendDMResponse:
+    async def send_dm(self, request: SendDMRequest) -> SendDMResponse:
         """
         Send Instagram direct message.
 
@@ -632,7 +765,7 @@ class InstagramClient:
         """
         message_data = {
             "recipient": {"id": request.recipient_id},
-            "message": {"text": request.message}
+            "message": {"text": request.message},
         }
 
         try:
@@ -640,17 +773,19 @@ class InstagramClient:
                 "POST",
                 "me/messages",
                 data=message_data,
-                use_facebook_api=True  # DMs use graph.facebook.com
+                use_facebook_api=True,  # DMs use graph.facebook.com
             )
 
             return SendDMResponse(
                 message_id=data.get("message_id", ""),
                 recipient_id=request.recipient_id,
-                success=True
+                success=True,
             )
 
         except InstagramAPIError as e:
-            logger.error("Failed to send DM", error=str(e), recipient=request.recipient_id)
+            logger.error(
+                "Failed to send DM", error=str(e), recipient=request.recipient_id
+            )
             error_msg = str(e)
             # Detect Advanced Access permission error
             if (
@@ -667,7 +802,9 @@ class InstagramClient:
                 )
             raise InstagramAPIError(error_msg)
         except Exception as e:
-            logger.error("Failed to send DM", error=str(e), recipient=request.recipient_id)
+            logger.error(
+                "Failed to send DM", error=str(e), recipient=request.recipient_id
+            )
             raise InstagramAPIError(f"Failed to send DM: {str(e)}")
 
     def get_rate_limit_info(self) -> RateLimitInfo:

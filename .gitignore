@@ -322,7 +322,6 @@ safety-report.json
 bandit-results.sarif
 
 # Docker
-.dockerignore
 docker-compose.override.yml
 
 # Monitoring

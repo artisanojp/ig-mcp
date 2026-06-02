@@ -168,6 +168,19 @@ class FacebookPage(BaseModel):
     instagram_business_account: Optional[Dict[str, str]] = None
 
 
+class FacebookPost(BaseModel):
+    """Facebook Page post with engagement counts."""
+
+    id: str
+    created_time: Optional[str] = None
+    message: Optional[str] = None
+    permalink_url: Optional[str] = None
+    status_type: Optional[str] = None
+    reactions_count: Optional[int] = None
+    comments_count: Optional[int] = None
+    shares_count: Optional[int] = None
+
+
 class AccountInsights(BaseModel):
     """Instagram account insights."""
 

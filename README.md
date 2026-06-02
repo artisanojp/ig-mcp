@@ -301,12 +301,53 @@ Add this to your MCP client configuration (e.g., Claude Desktop):
       "command": "python",
       "args": ["/path/to/ig-mcp/src/instagram_mcp_server.py"],
       "env": {
-        "INSTAGRAM_ACCESS_TOKEN": "your_access_token"
+        "INSTAGRAM_ACCESS_TOKEN": "your_access_token",
+        "MCP_TRANSPORT": "stdio",
+        "AUTH_ENABLED": "false"
       }
     }
   }
 }
 ```
+
+> Local stdio usage doesn't need authentication. Set `MCP_TRANSPORT=stdio` and
+> `AUTH_ENABLED=false` for a single-user local setup.
+
+## 🌐 Remote Deployment with Microsoft 365 Authentication
+
+For multi-user access (e.g. letting non-technical staff operate a shared company
+Instagram account), the server can run remotely over the **MCP Streamable HTTP**
+transport, gated by **Microsoft Entra ID (Microsoft 365)** sign-in:
+
+- The server acts as an OAuth 2.1 **Resource Server**. It validates Entra ID JWT
+  bearer tokens (signature, issuer, audience, expiry, tenant) and requires the
+  `IGMCP.Use` app role. Unauthenticated requests get a 401 with a `WWW-Authenticate`
+  challenge so MCP clients (Claude Desktop / claude.ai) can run the login flow.
+- The shared Instagram token stays server-side (Azure Key Vault) and is never
+  exposed to users — Entra ID auth controls **who** may call the server; the
+  Instagram token is **how** the server talks to Instagram. See `src/auth.py`.
+
+Key environment variables (see `env.example`):
+
+```env
+MCP_TRANSPORT=streamable-http
+MCP_HOST=0.0.0.0
+MCP_PORT=8000
+AUTH_ENABLED=true
+ENTRA_TENANT_ID=your_entra_tenant_id
+ENTRA_CLIENT_ID=your_server_app_registration_client_id
+ENTRA_REQUIRED_ROLE=IGMCP.Use
+SERVER_PUBLIC_URL=https://mcp.your-domain.com
+```
+
+Run locally over HTTP:
+
+```bash
+docker compose up --build   # serves http://localhost:8000/mcp, health at /health
+```
+
+Deploy to **Azure Container Apps** (ACR + Key Vault + managed identity) with the
+Bicep templates and CI workflow under [`infra/`](infra/README.md).
 
 ## Usage Examples
 
